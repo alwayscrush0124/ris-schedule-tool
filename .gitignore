@@ -1,0 +1,49 @@
+# === Python ===
+__pycache__/
+*.pyc
+
+# === Nuitka 建置產物 ===
+nuitka_build/
+nuitka_build_onefile/
+nuitka_build*.log
+build_exe_rerun.log
+
+# === 程式改版備份（*_before*.py / *.bak_*）===
+_ris_gui_before.py
+*.bak_*
+
+# === 執行期輸出／記錄（會一直累加，且含真實操作紀錄）===
+gui_log.txt
+gui_launch_stdout.log
+apply_log.txt
+plan.csv
+plan_report.txt
+本機設定.txt
+
+# === 開發期探測/傾印產物（含真實畫面內容）===
+window_dump.txt
+table.tsv
+table_debug.txt
+cell_probe.txt
+form_dump.txt
+grid_probe.txt
+write_test.txt
+options.txt
+分析_*.txt
+掃描_*.csv
+傾印_*.csv
+傾印_*.txt
+
+# === 真實院內資料：各分院醫師名單／帳號／對照表 ===
+# 這些是新竹臺大等多個分院的真實醫師姓名與代班帳號，
+# 不可外流。格式範例見 設定範例/。
+設定/
+檢查室/
+/accounts.csv
+/mapping.csv
+
+# === 真實班表文件 ===
+*.docx
+
+# === Claude Code 本機設定 ===
+.claude/settings.local.json
