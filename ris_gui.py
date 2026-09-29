@@ -101,6 +101,9 @@ COMMIT_WAIT = 0.6           # 每按一次 Enter 之後等格子反映新值。
                             # 第一次註定不會過（Enter 被吃掉），所以這個值
                             # 每列都會被付滿一次，不要設太大。
 COMMIT_ENTER_TRIES = 3      # Enter 最多按幾次（RIS 會吃掉第一個，見 write_cell）
+TYPE_PAUSE = 0.01           # send_keys 每個字元之間停多久。pywinauto 預設 0.05，
+                            # 一個帳號要打 0.5 秒。2026-09-29 調小；存檔認帳有問題
+                            # 就改回 0.05。
 MAX_SCROLL_STEPS = 15       # 表格離目前捲動位置太遠時，最多捲幾格滾輪去找那一列
 
 # 可以拿來篩選的欄位
@@ -136,7 +139,7 @@ def type_text(text):
     """
     escaped = "".join("{" + c + "}" if c in SEND_KEYS_SPECIAL else c
                       for c in text)
-    send_keys(escaped, with_spaces=True)
+    send_keys(escaped, pause=TYPE_PAUSE, with_spaces=True)
 
 
 def post_chars(text):
@@ -182,6 +185,27 @@ def type_into_editor(text):
 # 跟 RIS 溝通的部分
 # ----------------------------------------------------------------------
 
+class _LazyWrap(dict):
+    """放 UIA 元件的 dict，取出來的時候才包成 pywinauto 物件（包一次就留著）。
+
+    包一個要跨程序問好幾個問題（約 3 毫秒），一張 63 列的表有 852 個元件，
+    全包要 2.3 秒；實際改班只會點到其中幾格。已經是 pywinauto 物件的
+    （逐格讀法那條路給的）原樣放行。
+    """
+
+    def _wrap(self, key, v):
+        if v is not None and not isinstance(v, UIAWrapper):
+            v = UIAWrapper(UIAElementInfo(v))
+            dict.__setitem__(self, key, v)
+        return v
+
+    def __getitem__(self, key):
+        return self._wrap(key, dict.__getitem__(self, key))
+
+    def get(self, key, default=None):
+        return self._wrap(key, dict.get(self, key)) if key in self else default
+
+
 class Ris:
     def __init__(self):
         self.grid = None
@@ -195,6 +219,8 @@ class Ris:
         # 上一次寫入各階段花的時間 (打字, 等補完, 提交, 按了幾次Enter)，
         # 寫進 log 用。慢的時候才知道要往哪裡查。
         self.last_timing = (0, 0, 0, 0)
+        # 上一次 read_rows 用的是哪種讀法（「快取」或退回的「逐格」），寫進 log
+        self.last_read_mode = ""
         # 2026-08-10 效能診斷用，更細的拆解。只加欄位、不改既有邏輯，
         # 診斷完不需要了可以整段刪掉，不影響其他部分。
         # goto_row: (找格子, 進迴圈前的編輯器檢查, 捲動, 對焦, 點擊,
@@ -221,9 +247,14 @@ class Ris:
 
         app = Application(backend="uia").connect(handle=hwnd, timeout=20)
         self.win = app.window(handle=hwnd)
-        self.grid = (self.win.child_window(auto_id=FORM_AUTO_ID)
-                     .child_window(auto_id=GRID_AUTO_ID))
-        self.grid.wait("exists", timeout=15)
+        spec = (self.win.child_window(auto_id=FORM_AUTO_ID)
+                .child_window(auto_id=GRID_AUTO_ID))
+        spec.wait("exists", timeout=15)
+        # 存「找到的表格」本身，不存「怎麼找表格」的描述 ——
+        # 後者每用一次都會在 RIS 整個視窗樹裡重找一遍，實測每次 4 秒
+        # （2026-09-29，63 列的表）。每按一次「讀取」都會重新 connect，
+        # 所以使用者在 RIS 換畫面、重開之後也會重新找。
+        self.grid = spec.wrapper_object()
 
     @staticmethod
     def _cell_value(cell):
@@ -258,27 +289,31 @@ class Ris:
         所以這裡不再逐格去問「你是哪一欄」，而是靠位置判斷 ——
         每一列的第一格固定是列首，後面依序就是 COLS 的順序。
         只在第一列驗證一次順序，確認沒變才繼續。
+
+        2026-09-29：優先用 CacheRequest 一次把整張表撈回來（_scan_cached），
+        失敗才退回原本逐格問的讀法（_scan_live）。兩種讀法回傳的格式一樣，
+        後面的欄位順序檢查、空白列過濾都照舊。
         """
         rows = []
         self.cells = {}
-        self.row_elems = {}
-        data_rows = []
-        for c in self.grid.children():
-            name = c.window_text()
-            if name.startswith("資料列"):
-                data_rows.append((int(name.split()[1]), c))
+        self.row_elems = _LazyWrap()
+        try:
+            data_rows = self._scan_cached()
+            self.last_read_mode = "快取"
+        except Exception:
+            data_rows = self._scan_live()
+            self.last_read_mode = "逐格"
 
         total = len(data_rows)
         checked = False
 
-        for i, (idx, r) in enumerate(data_rows):
-            kids = r.children()
+        for i, (idx, r, kids, names_of, values_of) in enumerate(data_rows):
             if len(kids) < len(COLS) + 1:
                 continue
 
             if not checked:
                 # 只做一次：確認第一格真的是列首、欄位順序跟預期一致
-                got = [k.window_text().split()[0] for k in kids[:len(COLS) + 1]]
+                got = [n.split()[0] if n.split() else "" for n in names_of()]
                 if got[0] != "資料列" or got[1:] != COLS:
                     raise RuntimeError(
                         "表格欄位順序跟預期不符，為安全起見中止。\n"
@@ -286,7 +321,7 @@ class Ris:
                 checked = True
 
             cols = kids[1:len(COLS) + 1]
-            vals = [self._cell_value(k) for k in cols]
+            vals = values_of()
             row = dict(zip(COLS, vals))
             # 表格最後那列是空白的「新增列」，不能讓它混進清單 ——
             # 萬一被選到，程式會去點它、往裡面打字，等於生出一筆新記錄。
@@ -299,11 +334,78 @@ class Ris:
                 continue
             row["_row"] = idx
             rows.append(row)
-            self.cells[idx] = dict(zip(COLS, cols))
+            self.cells[idx] = _LazyWrap(zip(COLS, cols))
             self.row_elems[idx] = r
             if progress and (i + 1) % 5 == 0:
                 progress(i + 1, total)
         return rows
+
+    def _scan_live(self):
+        """原本的讀法：逐列、逐格跨程序去問。慢（14 列 3.9 秒），但最老實。
+
+        回傳 [(列號, 列元件, [格子元件...], 取前幾格名稱(), 取各欄值()), ...]
+        """
+        out = []
+        for c in self.grid.children():
+            name = c.window_text()
+            if not name.startswith("資料列"):
+                continue
+            kids = c.children()
+            head = kids[:len(COLS) + 1]
+            cols = kids[1:len(COLS) + 1]
+            out.append((int(name.split()[1]), c, kids,
+                        lambda head=head: [k.window_text() for k in head],
+                        lambda cols=cols: [self._cell_value(k) for k in cols]))
+        return out
+
+    def _scan_cached(self):
+        """用 UIA CacheRequest 一次撈回「所有列 + 每列所有格子 + 名稱與值」。
+
+        逐格讀每一格要跨程序問 2~3 次，表格越大越慢（14 列 3.9 秒、
+        40 列 8.7 秒）。這裡只問 RIS 一次，值一起帶回來。
+        拿回來的元件是完整的活元件（不是只有快照），後面點擊、捲動、
+        重讀都照常能用。回傳的是原始 UIA 元件，由 _LazyWrap 在真的
+        用到時才包成 pywinauto 物件（全部先包好要 2.3 秒，實際只會點到幾格）。
+
+        取值順序跟 _cell_value 一樣：LegacyIAccessible 的 Value ->
+        ValuePattern 的 Value -> 名稱。
+        回傳格式同 _scan_live。
+        """
+        NAME, VALUE, LEGACY_VALUE = 30005, 30045, 30093
+        iuia = IUIA()
+        req = iuia.iuia.CreateCacheRequest()
+        for pid in (NAME, VALUE, LEGACY_VALUE):
+            req.AddProperty(pid)
+        req.TreeScope = iuia.UIA_dll.TreeScope_Element | iuia.UIA_dll.TreeScope_Children
+        grid_el = self.grid.element_info.element
+        found = grid_el.FindAllBuildCache(iuia.UIA_dll.TreeScope_Children,
+                                          iuia.true_condition, req)
+
+        def prop(el, pid):
+            # 不支援的屬性會回一個「不支援」的 COM 物件，不是字串，一律當沒有
+            v = el.GetCachedPropertyValue(pid)
+            return v if isinstance(v, str) else None
+
+        def value(el):
+            for pid in (LEGACY_VALUE, VALUE):
+                v = prop(el, pid)
+                if v not in (None, ""):
+                    return v
+            return prop(el, NAME) or ""
+
+        out = []
+        for i in range(found.Length):
+            r = found.GetElement(i)
+            name = prop(r, NAME) or ""
+            if not name.startswith("資料列"):
+                continue
+            arr = r.GetCachedChildren()
+            kid_els = [arr.GetElement(j) for j in range(arr.Length)] if arr else []
+            names = [prop(k, NAME) or "" for k in kid_els[:len(COLS) + 1]]
+            vals = [value(k) for k in kid_els[1:len(COLS) + 1]]
+            out.append((int(name.split()[1]), r, kid_els,
+                        lambda names=names: names, lambda vals=vals: vals))
+        return out
 
     def _find_cell(self, idx, col):
         """拿某一格。優先用讀表格時建好的索引，找不到才回頭掃一次。
@@ -978,7 +1080,7 @@ class App(tk.Tk):
     def _value_choices(self):
         """「改成」下拉要列什麼，看現在選的是哪一欄。
 
-        排班醫師：代班帳號排前面（那是最常用的），全院醫師接在後面。
+        排班醫師：G+數字的醫師排前面（照編號），其他接在後面。
         其他欄位：用 欄位選項.csv（來自公版班表和工作時段設定），
                  那是該院區實際用得到的完整清單。
                  目前畫面上出現、但清單裡沒有的值也補進去 ——
@@ -986,13 +1088,34 @@ class App(tk.Tk):
         """
         col = self.col_var.get() if hasattr(self, "col_var") else DOCTOR_COL
         if col == DOCTOR_COL:
-            out = [f"{a[0]}  ({a[1] or '?'})"
-                   f"{'' if a[2].upper() == 'Y' else '  ※未驗證'}"
-                   for a in self.accounts]
+            # 2026-09-29 使用者要求：只顯示 RIS 畫面上看到的名稱（例如
+            # 「G12345王小明」），不再顯示「G12345  (G12345王小明)」。
+            # 要打的帳號記在 self.choice_map，_target_code 從那裡查回來。
+            #
+            # 有幾組是同一個 RIS 選項、只是帳號切法不同，顯示名稱一模一樣
+            # （例：代班清單的「0生醫」和全院醫師的「0」都顯示「0生醫公用帳號」）。
+            # 同名只留第一筆 —— 代班清單排前面，所以留下的是代班清單那筆。
+            self.choice_map = {}
+            out = []
+
+            def add(label, code, display):
+                if label not in self.choice_map:
+                    self.choice_map[label] = (code, display)
+                    out.append(label)
+
+            for a in self.accounts:
+                label = (a[1] or a[0]) + ("" if a[2].upper() == "Y" else "  ※未驗證")
+                add(label, a[0], a[1] or None)
             seen = {a[0] for a in self.accounts}
-            out += [f"{code}  ({display})" for code, display in self.doctors
-                    if code not in seen]
-            return out
+            shown = {(a[1] or a[0]) for a in self.accounts}
+            for code, display in self.doctors:
+                if code not in seen and display not in shown:
+                    add(display, code, display)
+            # 2026-09-29 使用者要求：G+數字的醫師（G12345王小明）集中排最前面、
+            # 照編號排，其他（均分池、公用帳號…）照原順序接在後面。
+            # 「GJW3W5乳篩均分」這種 G 開頭但不是數字的是均分池，不算醫師。
+            g_doctors = sorted(L for L in out if re.match(r"G\d", L))
+            return g_doctors + [L for L in out if not re.match(r"G\d", L)]
 
         out = list(self.options.get(col, []))
         have = set(out)
@@ -1120,6 +1243,7 @@ class App(tk.Tk):
         ttk.Radiobutton(r2, text="全部改成", variable=self.mode, value="one",
                         command=self.on_mode).pack(side="left", padx=(8, 2))
         self.acct_var = tk.StringVar()
+        self.choice_map = {}
         self.acct_cb = ttk.Combobox(r2, textvariable=self.acct_var,
                                     values=self._value_choices(), width=42)
         self.acct_cb.pack(side="left", padx=4)
@@ -1133,7 +1257,7 @@ class App(tk.Tk):
         self.rb_auto.pack(side="left", padx=(8, 4))
 
         r3 = ttk.Frame(bot); r3.pack(fill="x")
-        self.only_one = tk.BooleanVar(value=True)
+        self.only_one = tk.BooleanVar(value=False)
         ttk.Checkbutton(r3, text="先只改一列試試", variable=self.only_one)\
             .pack(side="left", padx=16)
 
@@ -1215,7 +1339,8 @@ class App(tk.Tk):
             rows = self.ris.read_rows(
                 progress=lambda i, n: self.q.put(("status", f"讀取中 {i}/{n}")))
             self.q.put(("rows", rows))
-            self.q.put(("log", f"讀到 {len(rows)} 列。（{time.time() - t0:.1f} 秒）"))
+            self.q.put(("log", f"讀到 {len(rows)} 列。（{time.time() - t0:.1f} 秒，"
+                               f"{self.ris.last_read_mode}讀法）"))
             if not rows:
                 self.q.put(("log", "表格是空的 —— 請確認 RIS 已經查詢出資料。"))
         self._run(job)
@@ -1290,8 +1415,8 @@ class App(tk.Tk):
     def _target_code(self):
         """從「改成」下拉解析出 (要打的值, 預期顯示)。
 
-        排班醫師的選項長這樣：「CCTAOFF  (CCTAOFF均分)」，
-        要打的是帳號、預期顯示是括號裡那串。
+        排班醫師的選項只顯示名稱（「CCTAOFF均分」），要打的帳號從
+        self.choice_map 查回來。直接打字的話，打顯示名稱或帳號都可以。
         其他欄位沒有這種帳號/顯示的分別，選什麼就打什麼。
         """
         raw = self.acct_var.get().strip()
@@ -1299,6 +1424,12 @@ class App(tk.Tk):
             return None, None
         if self.target_col() != DOCTOR_COL:
             return raw, raw
+        if raw in self.choice_map:
+            return self.choice_map[raw]
+        # 自己打的字：先當成顯示名稱找，找不到再當帳號（舊的行為）
+        for code, display in self.choice_map.values():
+            if display == raw:
+                return code, display
         code = raw.split()[0]
         display = None
         for a in self.accounts:
