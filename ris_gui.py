@@ -247,14 +247,47 @@ class Ris:
 
         app = Application(backend="uia").connect(handle=hwnd, timeout=20)
         self.win = app.window(handle=hwnd)
-        spec = (self.win.child_window(auto_id=FORM_AUTO_ID)
-                .child_window(auto_id=GRID_AUTO_ID))
-        spec.wait("exists", timeout=15)
         # 存「找到的表格」本身，不存「怎麼找表格」的描述 ——
         # 後者每用一次都會在 RIS 整個視窗樹裡重找一遍，實測每次 4 秒
         # （2026-09-29，63 列的表）。每按一次「讀取」都會重新 connect，
         # 所以使用者在 RIS 換畫面、重開之後也會重新找。
-        self.grid = spec.wrapper_object()
+        self.grid = self._find_grid_fast(hwnd, timeout=15)
+        if self.grid is None:
+            spec = (self.win.child_window(auto_id=FORM_AUTO_ID)
+                    .child_window(auto_id=GRID_AUTO_ID))
+            spec.wait("exists", timeout=5)     # 快的找法已經等過 15 秒了
+            self.grid = spec.wrapper_object()
+
+    @staticmethod
+    def _find_grid_fast(hwnd, timeout):
+        """直接叫 UIA 的 FindFirst 找表格，找不到回 None（由上層退回舊找法）。
+
+        pywinauto 的 child_window(...).wait() + wrapper_object() 會在
+        pywinauto 這一側把 RIS 整棵視窗樹一個一個元件拉回來比對，實測要
+        12.8 秒（等存在 8.5 + 取元件 4.3）。FindFirst 是在 UIA 那一側比對，
+        同樣的東西 0.03 秒（2026-09-29 實測）。
+        """
+        iuia = IUIA()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                root = iuia.iuia.ElementFromHandle(hwnd)
+                form = root.FindFirst(
+                    iuia.UIA_dll.TreeScope_Descendants,
+                    iuia.iuia.CreatePropertyCondition(
+                        iuia.UIA_dll.UIA_AutomationIdPropertyId, FORM_AUTO_ID))
+                grid = form.FindFirst(
+                    iuia.UIA_dll.TreeScope_Children,
+                    iuia.iuia.CreatePropertyCondition(
+                        iuia.UIA_dll.UIA_AutomationIdPropertyId, GRID_AUTO_ID)) \
+                    if form else None
+                if grid:
+                    return UIAWrapper(UIAElementInfo(grid))
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.3)
 
     @staticmethod
     def _cell_value(cell):
@@ -606,12 +639,28 @@ class Ris:
         """
         strategies = []
         try:
-            bar = self.grid.descendants(control_type="ScrollBar")[0]
-            pgdn = bar.children(title="向下翻頁")[0]
-            pgup = bar.children(title="向上翻頁")[0]
-
+            # 直接叫 UIA 找表格底下那一層的捲軸（0.09 秒）；
+            # pywinauto 的 descendants() 會把整張表的元件全拉回來（1.1 秒）。
+            try:
+                iuia = IUIA()
+                found = self.grid.element_info.element.FindAll(
+                    iuia.UIA_dll.TreeScope_Children,
+                    iuia.iuia.CreatePropertyCondition(
+                        iuia.UIA_dll.UIA_ControlTypePropertyId,
+                        iuia.UIA_dll.UIA_ScrollBarControlTypeId))
+                bar = UIAWrapper(UIAElementInfo(found.GetElement(0)))
+            except Exception:
+                bar = self.grid.descendants(control_type="ScrollBar")[0]
+            # 翻頁按鈕要每次翻之前才找，不能事先抓好 ——
+            # 捲到最上面時「向上翻頁」根本不存在（捲到底時換「向下翻頁」不在）。
+            # 以前是兩顆都要先找到，表格停在最上面（最常見的狀況）時就少一顆、
+            # 整個翻頁策略被跳過，只剩滾輪（2026-09-29 發現）。
             def page(direction):
-                btn = pgdn if direction < 0 else pgup
+                title = "向下翻頁" if direction < 0 else "向上翻頁"
+                try:
+                    btn = bar.children(title=title)[0]
+                except Exception:
+                    return False            # 已經到頭了，這個方向翻不動
                 try:
                     btn.invoke()
                 except Exception:
@@ -1333,13 +1382,16 @@ class App(tk.Tk):
     def on_load(self):
         def job():
             self.q.put(("status", "連線中..."))
+            t_conn = time.time()
             self.ris.connect()
+            t_conn = time.time() - t_conn
             self.q.put(("status", "讀取表格中..."))
             t0 = time.time()
             rows = self.ris.read_rows(
                 progress=lambda i, n: self.q.put(("status", f"讀取中 {i}/{n}")))
             self.q.put(("rows", rows))
-            self.q.put(("log", f"讀到 {len(rows)} 列。（{time.time() - t0:.1f} 秒，"
+            self.q.put(("log", f"讀到 {len(rows)} 列。（連線 {t_conn:.1f} 秒 + "
+                               f"讀表 {time.time() - t0:.1f} 秒，"
                                f"{self.ris.last_read_mode}讀法）"))
             if not rows:
                 self.q.put(("log", "表格是空的 —— 請確認 RIS 已經查詢出資料。"))
