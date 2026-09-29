@@ -221,6 +221,8 @@ class Ris:
         self.last_timing = (0, 0, 0, 0)
         # 上一次 read_rows 用的是哪種讀法（「快取」或退回的「逐格」），寫進 log
         self.last_read_mode = ""
+        # 上一次成功點進去的列號，決定下一次要捲動時先往哪個方向翻
+        self._last_goto_idx = None
         # 2026-08-10 效能診斷用，更細的拆解。只加欄位、不改既有邏輯，
         # 診斷完不需要了可以整段刪掉，不影響其他部分。
         # goto_row: (找格子, 進迴圈前的編輯器檢查, 捲動, 對焦, 點擊,
@@ -255,7 +257,11 @@ class Ris:
         if self.grid is None:
             spec = (self.win.child_window(auto_id=FORM_AUTO_ID)
                     .child_window(auto_id=GRID_AUTO_ID))
-            spec.wait("exists", timeout=5)     # 快的找法已經等過 15 秒了
+            try:
+                spec.wait("exists", timeout=5)  # 快的找法已經等過 15 秒了
+            except Exception:
+                raise RuntimeError("找不到「醫師班表維護」的表格，"
+                                   "請確認 RIS 開在那個畫面、而且已經查詢出資料。")
             self.grid = spec.wrapper_object()
 
     @staticmethod
@@ -547,14 +553,78 @@ class Ris:
             self.last_goto_detail = (t_find, t_early_on, 0, 0, 0, 0, 0)
             return True, "編輯器已經開著"
 
-        for attempt in range(3):
-            t0 = time.time()
+        # 2026-09-29：先看這一格在不在畫面上，不在就不要點 ——
+        # 以前是不管三七二十一先點 3 次、每次等 1 秒，都失敗了才開始捲，
+        # 畫面外的列光這樣就白花 3~4 秒（台大總院第 143 列實測「點」14 秒）。
+        # 畫面外的格子位置是 (0,0,0,0)，點下去是點到螢幕左上角，本來就沒用。
+        t0 = time.time()
+        if not self._visible(cell):
             try:
                 cell.iface_scrollitem.ScrollIntoView()
             except Exception:
                 pass
-            t_scroll = time.time() - t0
+            cell = self._find_cell(idx, col) or cell
+        t_scroll = time.time() - t0
 
+        if self._visible(cell):
+            ok, how = self._click_until_editor(cell, 3, t_find, t_early_on, t_scroll)
+            if ok:
+                self._last_goto_idx = idx
+                return True, how
+
+        # 表格是虛擬化的：離目前捲動位置太遠的列，ScrollIntoView 叫不動、
+        # 點了也沒用，因為那一列根本沒被畫出來（不是格子找不到，是格子
+        # 在畫面外）。2026-07-30 用台大總院 135 列的表實測踩到：第 0/10/30
+        # 列都正常，隔比較遠的第 60/90/120 列點 3 次都開不了編輯器。
+        #
+        # 先試垂直捲軸的「向下翻頁／向上翻頁」按鈕 —— 實測一次翻頁的幅度
+        # 遠比滑鼠滾輪一格大很多（從第 60 列附近翻一頁就到第 90 列了），
+        # 長距離跳頁效率好很多。兩個方向都試，因為也可能翻頁翻過頭；
+        # 先翻哪個方向看上一列改的是哪裡（批次通常是由上往下改）。
+        # 每翻一次先確認目標格出現在畫面上才點，沒出現就繼續翻，
+        # 不浪費時間去點一個看不到的格子。
+        # 找不到翻頁按鈕、或翻頁翻不到（例如剛好卡在按鈕翻不動的邊界）
+        # 才退回滑鼠中鍵滾輪一格一格捲，當最後手段做微調。
+        # 這整段都只有捲動和點擊，不會打字，安全，頂多是點不到。
+        last = self._last_goto_idx
+        order = (1, -1) if (last is not None and idx < last) else (-1, 1)
+        for how_scroll, step_fn in self._scroll_strategies():
+            for direction in order:
+                for _step in range(MAX_SCROLL_STEPS):
+                    if not step_fn(direction):
+                        break
+                    time.sleep(0.25)
+
+                    cell = self._find_cell(idx, col)
+                    if cell is None or not self._visible(cell):
+                        continue
+                    ok, _how = self._click_until_editor(cell, 2, t_find, t_early_on,
+                                                        time.time() - t0)
+                    if ok:
+                        way = "下" if direction < 0 else "上"
+                        self._last_goto_idx = idx
+                        return True, f"{how_scroll}{way}{_step + 1}次後點到"
+
+        return False, (f"翻頁和滾輪兩個方向都試過，"
+                        f"第 {idx} 列「{col}」的編輯器還是沒開起來")
+
+    def _visible(self, cell):
+        """這一格有沒有整格出現在表格的可視範圍裡。
+
+        畫面外的格子（虛擬化、沒畫出來）位置是 (0,0,0,0)；
+        捲到一半、被切掉的格子也當成看不到，交給捲動處理。
+        """
+        try:
+            cr = cell.rectangle()
+            gr = self.grid.rectangle()
+            return (cr.bottom > cr.top and cr.right > cr.left
+                    and cr.top >= gr.top and cr.bottom <= gr.bottom)
+        except Exception:
+            return False
+
+    def _click_until_editor(self, cell, tries, t_find=0, t_early_on=0, t_scroll=0):
+        """點這一格，每次最多等 1 秒看編輯器有沒有開在它上面。回傳 (成功, 說明)。"""
+        for attempt in range(tries):
             t0 = time.time()
             try:
                 self.win.set_focus()
@@ -588,48 +658,7 @@ class Ris:
             self.last_goto_detail = (t_find, t_early_on, t_scroll, t_focus,
                                       t_click, time.time() - t0, attempt + 1)
             self.last_editor_poll_detail = (n_polls, t_polls, t_poll_max)
-
-        # 表格是虛擬化的：離目前捲動位置太遠的列，ScrollIntoView 叫不動、
-        # 點了也沒用，因為那一列根本沒被畫出來（不是格子找不到，是格子
-        # 在畫面外）。2026-07-30 用台大總院 135 列的表實測踩到：第 0/10/30
-        # 列都正常，隔比較遠的第 60/90/120 列點 3 次都開不了編輯器。
-        #
-        # 先試垂直捲軸的「向下翻頁／向上翻頁」按鈕 —— 實測一次翻頁的幅度
-        # 遠比滑鼠滾輪一格大很多（從第 60 列附近翻一頁就到第 90 列了），
-        # 長距離跳頁效率好很多。兩個方向都試，因為不確定目標列在上面
-        # 還是下面，也可能翻頁翻過頭。
-        # 找不到翻頁按鈕、或翻頁翻不到（例如剛好卡在按鈕翻不動的邊界）
-        # 才退回滑鼠中鍵滾輪一格一格捲，當最後手段做微調。
-        # 這整段都只有捲動和點擊，不會打字，安全，頂多是點不到。
-        for how_scroll, step_fn in self._scroll_strategies():
-            for direction in (-1, 1):
-                for _step in range(MAX_SCROLL_STEPS):
-                    if not step_fn(direction):
-                        break
-                    time.sleep(0.25)
-
-                    cell = self._find_cell(idx, col)
-                    if cell is None:
-                        continue
-                    try:
-                        cell.iface_scrollitem.ScrollIntoView()
-                    except Exception:
-                        pass
-                    try:
-                        self.win.set_focus()
-                        cell.click_input()
-                    except Exception:
-                        continue
-
-                    deadline = time.time() + 1.0
-                    while time.time() < deadline:
-                        if self._editor_on(cell):
-                            way = "下" if direction < 0 else "上"
-                            return True, f"{how_scroll}{way}{_step + 1}次後點到"
-                        time.sleep(0.03)
-
-        return False, (f"點了 3 次、翻頁和滾輪兩個方向都試過，"
-                        f"第 {idx} 列「{col}」的編輯器還是沒開起來")
+        return False, f"點了 {tries} 次編輯器都沒開"
 
     def _scroll_strategies(self):
         """回傳 [(說明, 捲動函式), ...]，捲動函式(direction) -> 有沒有真的捲到。
@@ -1618,7 +1647,7 @@ class App(tk.Tk):
                     t_e1, t_e2, t_w1 = self.ris.last_commit_detail
                     n_ep, t_ep, t_epmax = self.ris.last_editor_poll_detail
                     n_wp, t_wp, t_wpmax = self.ris.last_wait_value_detail
-                    self.q.put(("log", f"      debug 點=[找格子{t_fnd:.2f} "
+                    self.q.put(("log", f"      debug 點=[{how} 找格子{t_fnd:.2f} "
                                        f"早期editor檢查{t_eon:.2f} 捲{t_scr:.2f} "
                                        f"焦{t_foc:.2f} 擊{t_clk:.2f} "
                                        f"等編輯器{t_ew:.2f}/{n_clk}次點擊] "
