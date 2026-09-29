@@ -54,15 +54,15 @@ GUI 出現前的舊流程，留著當備援。差別是它多一層 `plan.csv`�
 ### 2. 看程式打算改什麼（不會動任何東西）
 
 ```
-cd D:\Users\G04199\ris-schedule-tool
-python 6_plan.py G04564
+cd <專案資料夾>\ris-schedule-tool
+python 6_plan.py G12345
 ```
 
 只請半天就加參數：
 
 ```
-python 6_plan.py G04564 --shift AM     # 只改上半天
-python 6_plan.py G04564 --shift PM     # 只改下半天
+python 6_plan.py G12345 --shift AM     # 只改上半天
+python 6_plan.py G12345 --shift PM     # 只改下半天
 ```
 
 報告會分成幾區：**會修改的** / **需要手動處理的** / **跳過的**。
@@ -108,7 +108,7 @@ python 7_apply.py                # 改全部
 **不可以用上下鍵來「提交」那一列。**
 格子的編輯器是個下拉式方塊，方向鍵改的是**選單選到第幾項**，不是游標在第幾列。
 選單依字母排序，所以一個 DOWN 就會：
-`NEUMRIOFF均分 → PLFOFF均分`、`G04564薛硯中 → G04586陳信銘`。
+`NEUMRIOFF均分 → PLFOFF均分`、`G12345王小明 → G12346李小華`。
 同一天實測把 8 個班掛到一位完全無關的醫師身上（沒存檔，被全表核對擋下來）。
 提交交給 Enter，它同時完成「確認這一格」和「離開這一列」。
 
