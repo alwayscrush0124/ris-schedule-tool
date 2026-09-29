@@ -47,3 +47,6 @@ options.txt
 
 # === Claude Code 本機設定 ===
 .claude/settings.local.json
+
+# === 免安裝版建置產物 ===
+portable_build/
