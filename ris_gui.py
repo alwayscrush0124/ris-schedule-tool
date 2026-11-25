@@ -26,6 +26,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+from ctypes import wintypes
 from datetime import datetime
 from tkinter import ttk, messagebox
 
@@ -105,6 +106,8 @@ TYPE_PAUSE = 0.01           # send_keys 每個字元之間停多久。pywinauto 
                             # 一個帳號要打 0.5 秒。2026-09-29 調小；存檔認帳有問題
                             # 就改回 0.05。
 MAX_SCROLL_STEPS = 15       # 表格離目前捲動位置太遠時，最多捲幾格滾輪去找那一列
+SLOW_ROW_SEC = 8.0          # 一列超過這麼久就把計時細節寫進 gui_log.txt（不顯示在訊息區）。
+                            # 歷史紀錄大多 4~6 秒，8 秒以上才算異常。
 
 # 可以拿來篩選的欄位
 FILTERS = ["排班醫師", "起始日期", "統計用分類碼", "排班類別", "排班時段", "門急住限制"]
@@ -118,6 +121,17 @@ EDITABLE = [DOCTOR_COL, "排班時段", "統計用分類碼", "排班類別",
 
 def norm(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+def row_tag(r):
+    """log 用：這一列是哪一班，例如「20261201 上半天 CT/NEUCT」。
+
+    列號只在這次讀表有效，重新查詢就對不上；存檔後要回頭查改了哪幾班，
+    得靠日期、時段、班別。
+    """
+    shift = norm(r.get("排班時段")).split(" (")[0]     # 「上半天 (00:00-11:59)」只留「上半天」
+    kind = "/".join(x for x in (norm(r.get("統計用分類碼")), norm(r.get("排班類別"))) if x)
+    return " ".join(x for x in (norm(r.get("起始日期")), shift, kind) if x)
 
 
 # send_keys 會把這些字元當成語法（分組、修飾鍵、重複次數…），
@@ -173,12 +187,54 @@ def type_into_editor(text):
 
     ASCII 那條是今天實際存檔驗證過的路徑，所以能用就用；
     非 ASCII 只有 WM_CHAR 送得進去。
+    回傳實際用了哪一種（寫進 log，出問題時才知道是哪條路）。
     """
     if all(ord(c) < 128 for c in text):
         type_text(text)
-        return
-    if not post_chars(text):
-        type_text(text)        # 拿不到原生 handle 就死馬當活馬醫
+        return "鍵盤"
+    if post_chars(text):
+        return "WM_CHAR"
+    type_text(text)        # 拿不到原生 handle 就死馬當活馬醫
+    return "鍵盤"
+
+
+# ----------------------------------------------------------------------
+# 送按鍵／點擊之前的安全檢查
+# ----------------------------------------------------------------------
+# send_keys 和滑鼠點擊都是送給「當下在最前面／在那個位置上」的視窗，
+# 不一定是 RIS。使用者中途點了別的視窗，字就會打進那個視窗；
+# RIS 自己跳出對話框時，接下來的 Enter 會直接按下對話框的預設按鈕。
+# 所以每次送之前都先確認目標真的是 RIS 的班表視窗，不是就中止、什麼都不送。
+
+class GuardError(RuntimeError):
+    """要送按鍵或點擊之前，發現目標不是 RIS 的班表（被別的視窗蓋住、RIS 跳出對話框…）。"""
+
+
+GA_ROOT = 2
+GUARD_WAIT = 0.5    # 檢查沒過時最多再等幾秒（切換視窗的瞬間可能短暫不一致）
+
+# 自己載一份 user32：設定 argtypes 不會影響到 pywinauto 用的那份
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_u32.GetForegroundWindow.restype = wintypes.HWND
+_u32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+_u32.GetAncestor.restype = wintypes.HWND
+_u32.WindowFromPoint.argtypes = [wintypes.POINT]
+_u32.WindowFromPoint.restype = wintypes.HWND
+_u32.IsWindow.argtypes = [wintypes.HWND]
+_u32.IsWindowEnabled.argtypes = [wintypes.HWND]
+_u32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+
+def window_desc(h):
+    """視窗的標題和類別，寫進錯誤訊息用（萬一誤判，才知道當時最前面是什麼）。"""
+    if not h:
+        return "（沒有視窗）"
+    cls = ctypes.create_unicode_buffer(256)
+    title = ctypes.create_unicode_buffer(256)
+    _u32.GetClassNameW(h, cls, 256)
+    _u32.GetWindowTextW(h, title, 256)
+    return f"「{title.value or '無標題'}」({cls.value})"
 
 
 # ----------------------------------------------------------------------
@@ -221,6 +277,14 @@ class Ris:
         self.last_timing = (0, 0, 0, 0)
         # 上一次 read_rows 用的是哪種讀法（「快取」或退回的「逐格」），寫進 log
         self.last_read_mode = ""
+        # 上一次 read_rows 看到幾個「資料列」（含空白的新增列）。
+        # 改完前後不一樣 = 表格多了或少了列（例如字打進了最下面的新增列）
+        self.last_raw_count = None
+        # 上一次 write_cell 是用哪條路把值放進去的：鍵盤 / WM_CHAR / 直接設值
+        self.last_path = ""
+        # RIS 主視窗、以及班表所在的頂層視窗（送按鍵前檢查用，connect 時設定）
+        self.hwnd = None
+        self.top = None
         # 上一次成功點進去的列號，決定下一次要捲動時先往哪個方向翻
         self._last_goto_idx = None
         # 2026-08-10 效能診斷用，更細的拆解。只加欄位、不改既有邏輯，
@@ -263,6 +327,68 @@ class Ris:
                 raise RuntimeError("找不到「醫師班表維護」的表格，"
                                    "請確認 RIS 開在那個畫面、而且已經查詢出資料。")
             self.grid = spec.wrapper_object()
+
+        # 班表所在的頂層視窗：送按鍵時它必須在最前面、而且沒被對話框鎖住。
+        # 用表格往上找，而不是直接用主視窗 —— 班表畫面如果是獨立的視窗，
+        # 編輯時在最前面的是它，不是主視窗。
+        self.hwnd = hwnd
+        try:
+            gh = self.grid.handle
+        except Exception:
+            gh = None
+        self.top = (_u32.GetAncestor(gh, GA_ROOT) if gh else None) or hwnd
+
+    # ---------- 送按鍵／點擊前的檢查（見 GuardError 上面的說明）----------
+    def _window_problem(self):
+        """班表視窗還在、而且沒被對話框鎖住嗎？有問題回傳原因，沒問題回 None。"""
+        if not self.top or not _u32.IsWindow(self.top):
+            return "找不到 RIS 的班表視窗（可能被關掉了）"
+        if not _u32.IsWindowEnabled(self.top):
+            # 對話框（訊息、確認…）開著的時候，它底下的視窗會被鎖住
+            return "RIS 跳出了對話框（班表視窗被鎖住了）"
+        return None
+
+    def _keys_problem(self):
+        why = self._window_problem()
+        if why:
+            return why
+        fg = _u32.GetForegroundWindow()
+        if fg != self.top:
+            return f"目前在最前面的不是 RIS 的班表，而是 {window_desc(fg)}"
+        return None
+
+    def _click_problem(self, cell):
+        why = self._window_problem()
+        if why:
+            return why
+        r = cell.rectangle()
+        pt = wintypes.POINT((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        h = _u32.WindowFromPoint(pt)
+        root = _u32.GetAncestor(h, GA_ROOT) if h else None
+        if root != self.top:
+            return f"要點的那一格被別的視窗蓋住了：{window_desc(root)}"
+        return None
+
+    @staticmethod
+    def _require(check, what):
+        """check() 沒問題就回來；有問題就再等一下（切換視窗的瞬間），還是不行就丟 GuardError。"""
+        deadline = time.time() + GUARD_WAIT
+        while True:
+            why = check()
+            if not why:
+                return
+            if time.time() >= deadline:
+                raise GuardError(f"{why}。{what}")
+            time.sleep(0.05)
+
+    def check_keys(self, what):
+        """送按鍵之前呼叫：班表視窗要在最前面、沒被對話框鎖住。不行就丟 GuardError。
+        what：如果因此中止，這一格現在是什麼狀態（給使用者看）。"""
+        self._require(self._keys_problem, what)
+
+    def check_click(self, cell, what):
+        """點擊之前呼叫：那一格的位置上真的是 RIS 班表（沒被別的視窗或對話框蓋住）。"""
+        self._require(lambda: self._click_problem(cell), what)
 
     @staticmethod
     def _find_grid_fast(hwnd, timeout):
@@ -344,6 +470,7 @@ class Ris:
             self.last_read_mode = "逐格"
 
         total = len(data_rows)
+        self.last_raw_count = total
         checked = False
 
         for i, (idx, r, kids, names_of, values_of) in enumerate(data_rows):
@@ -632,6 +759,10 @@ class Ris:
                 return False, f"點選失敗: {type(e).__name__}"
             t_focus = time.time() - t0
 
+            # 點下去之前確認那個位置真的是 RIS 班表 ——
+            # 被別的視窗或 RIS 的對話框蓋住時，點下去會點到它們（可能按到按鈕）
+            self.check_click(cell, "還沒點下去，也還沒打字。")
+
             t0 = time.time()
             try:
                 cell.click_input()
@@ -704,6 +835,8 @@ class Ris:
             pass
 
         def wheel(direction):
+            # 滾輪也是送到滑鼠位置上的視窗，先確認那裡是 RIS 班表
+            self.check_click(self.grid, "只是在捲動表格，還沒打字。")
             try:
                 grid_rect = self.grid.rectangle()
                 cx = (grid_rect.left + grid_rect.right) // 2
@@ -784,6 +917,7 @@ class Ris:
         """
         # 2026-08-10 效能診斷：每次呼叫先歸零，避免殘留上一列的數字。
         self.last_commit_detail = (0, 0, 0)
+        self.last_path = ""
         before = self.cell_text(idx, col)
         # 「已經是目標值」的判斷要跟後面補完比對用同一套嚴不嚴格規則。
         # 之前這裡永遠用 startswith，害「LDCT國健」被誤判成已經是「LDCT」
@@ -795,9 +929,16 @@ class Ris:
         if already:
             return True, before, ""          # 已經是目標值了
 
+        # 送按鍵之前的檢查失敗時，告訴使用者這一格停在什麼狀態
+        left_typed = (f"第 {idx} 列「{col}」的編輯器裡可能還留著打好、但還沒提交的字，"
+                      "請回 RIS 在那一格按 ESC 取消。")
+        maybe_committed = (f"第 {idx} 列已經按過 Enter，可能已經改了，"
+                           "請回 RIS 看那一格，不確定就重新查詢並選「否」還原。")
+
+        self.check_keys(f"第 {idx} 列還沒打字，沒被改到。")
         t0 = time.time()
         send_keys("^a")
-        type_into_editor(code)
+        self.last_path = type_into_editor(code)
         t_type = time.time() - t0
         t0 = time.time()
 
@@ -825,6 +966,7 @@ class Ris:
         # 打字是已經驗證過能存進資料庫的路徑，所以先打字、失敗才退這一步。
         if not matched(shown):
             if self.set_editor_text(want):
+                self.last_path = "直接設值"
                 deadline = time.time() + AUTOCOMPLETE_WAIT
                 while time.time() < deadline:
                     shown = self.editor_text()
@@ -835,6 +977,7 @@ class Ris:
 
         # 兩條路都放不進去（打錯值、選單裡沒這一項…）-> 取消，不留痕跡
         if not matched(shown):
+            self.check_keys(left_typed)
             send_keys("{ESC}")
             time.sleep(0.3)
             if not shown:
@@ -860,11 +1003,16 @@ class Ris:
         # 不會像方向鍵那樣改到下拉選單的值。
         #
         # 「重抓元件」這種比較貴的手段留到 Enter 都按完還是不對時才用。
+        #
+        # 每一個 Enter 之前都檢查一次：提交時 RIS 如果跳出對話框，
+        # 下一個 Enter 就會按到對話框的預設按鈕。
         t0 = time.time()
         now = ""
+        self.check_keys(left_typed)
         t_e0 = time.time()
         send_keys("{ENTER}")
         t_enter1 = time.time() - t_e0
+        self.check_keys(maybe_committed)
         t_e0 = time.time()
         send_keys("{ENTER}")
         t_enter2 = time.time() - t_e0
@@ -877,6 +1025,7 @@ class Ris:
             if ok:
                 self.last_timing = (t_type, t_auto, time.time() - t0, i + 2)
                 return True, now, ""
+            self.check_keys(maybe_committed)
             send_keys("{ENTER}")
 
         self.refresh_cell(idx, col)
@@ -1115,6 +1264,51 @@ def plan_for(row, mapping):
     return None, None, "對照表沒有這種班別"
 
 
+def check_after(base, fresh, col, writes, attempted, base_count=None, fresh_count=None):
+    """收尾核對：改之前、改之後各讀一次整張表，逐列逐欄完全比對。
+
+    （純比對，不碰 RIS，方便單獨測試。）
+    base / fresh：改之前、改之後 read_rows 的結果
+    col：這次改的欄位
+    writes：{列號: 寫完當下讀到的值}，改好的列那一格應該是這個值
+    attempted：動過手的列（含失敗、中途停止的）
+    base_count / fresh_count：前後各讀到幾個「資料列」（含空白新增列）
+
+    回傳 dict：
+      strays   不該動的列被改了              [(列號, 欄位, 原本, 現在)]
+      wrong    要改的那一格不是預期的值      [(列號, 現在, 預期)]
+      side     改的那一列，其他欄位也變了    [(列號, 欄位, 原本, 現在)]
+      missing  改完之後不見的列              [列號]
+      extra    改完之後多出來的列            [列號]
+      count    列數變了 (改前, 改後)，沒變是 None
+
+    以前只比對要改的那一欄、而且用「開頭相同就算對」，
+    「LDCT」變成「LDCT國健」、空白格被打進東西都會被放過；
+    也不看列數，字打進最底下空白的新增列抓不到。
+    """
+    before = {r["_row"]: r for r in base}
+    after = {r["_row"]: r for r in fresh}
+    out = {"strays": [], "wrong": [], "side": [], "missing": [], "extra": [], "count": None}
+    for i, b in sorted(before.items()):
+        a = after.get(i)
+        if a is None:
+            out["missing"].append(i)
+            continue
+        for c in COLS:
+            was, now = norm(b.get(c)), norm(a.get(c))
+            if c == col and i in attempted:
+                # 改好的列要是寫完當下的值；試過但失敗（已 ESC）的列要維持原值
+                want = norm(writes[i]) if i in writes else was
+                if now != want:
+                    out["wrong"].append((i, now, want))
+            elif now != was:
+                (out["side"] if i in attempted else out["strays"]).append((i, c, was, now))
+    out["extra"] = sorted(set(after) - set(before))
+    if base_count is not None and fresh_count is not None and base_count != fresh_count:
+        out["count"] = (base_count, fresh_count)
+    return out
+
+
 # ----------------------------------------------------------------------
 # 介面
 # ----------------------------------------------------------------------
@@ -1143,8 +1337,11 @@ class App(tk.Tk):
         self._load_config()
         self.q = queue.Queue()
         self.busy = False
+        self.applying = False                # 正在改 RIS（不是讀取）
+        self.stop_req = threading.Event()    # 按了「停止」：做完目前這一列就停
 
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self._drain)
 
     # ---------- 設定 ----------
@@ -1341,6 +1538,8 @@ class App(tk.Tk):
 
         self.btn_go = ttk.Button(r3, text="開始修改", command=self.on_apply)
         self.btn_go.pack(side="left", padx=10, pady=6)
+        self.btn_stop = ttk.Button(r3, text="停止", command=self.on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(0, 10), pady=6)
 
         ttk.Label(r3, text="程式不會存檔，改完請自己回 RIS 檢查並按存檔",
                   foreground="#b00").pack(side="left", padx=10)
@@ -1361,6 +1560,10 @@ class App(tk.Tk):
     def log(self, s):
         self.txt.insert("end", f"{datetime.now():%H:%M:%S}  {s}\n")
         self.txt.see("end")
+        self.log_file(s)
+
+    def log_file(self, s):
+        """只寫進 gui_log.txt，不顯示在訊息區（給事後查問題用的細節）。"""
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {s}\n")
 
@@ -1371,6 +1574,8 @@ class App(tk.Tk):
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self.log(payload)
+                elif kind == "file":
+                    self.log_file(payload)
                 elif kind == "status":
                     self.lbl_status.config(text=payload)
                 elif kind == "rows":
@@ -1383,11 +1588,30 @@ class App(tk.Tk):
                     (messagebox.showinfo if ok else messagebox.showwarning)(title, body)
                 elif kind == "done":
                     self.busy = False
+                    self.applying = False
                     self.btn_load.config(state="normal")
                     self.btn_go.config(state="normal")
+                    self.btn_stop.config(state="disabled")
         except queue.Empty:
             pass
         self.after(120, self._drain)
+
+    def on_stop(self):
+        """不會在打字打到一半時停：做完目前這一列（或在這一列開始前）才停。"""
+        if self.applying and not self.stop_req.is_set():
+            self.stop_req.set()
+            self.btn_stop.config(state="disabled")
+            self.log("收到「停止」：做完目前這一列就停下來。")
+
+    def on_close(self):
+        """改到一半關掉視窗，RIS 的某一格可能停在打字打到一半。先確認。"""
+        if self.applying and not messagebox.askyesno(
+                "還在修改中",
+                "程式還在操作 RIS。現在關閉，RIS 的某一格可能停在打字打到一半。\n\n"
+                "建議先按「停止」，等訊息區出現「完成 … 列」再關。\n\n"
+                "確定要直接關閉嗎？", icon="warning", default="no"):
+            return
+        self.destroy()
 
     def _run(self, fn):
         if self.busy:
@@ -1588,31 +1812,64 @@ class App(tk.Tk):
             self.log("已取消，什麼都沒改。")
             return
 
+        # log 開頭記下院區和日期範圍，事後回頭看才知道是哪一批
+        campus = self.campus
+        dates = sorted(norm(r["起始日期"]) for r, _c, _d in targets)
+        date_span = dates[0] if dates[0] == dates[-1] else f"{dates[0]} ~ {dates[-1]}"
+
         def job():
             self.q.put(("log", "=" * 60))
             self.q.put(("log", f"開始修改 {len(targets)} 列的「{col}」  "
                                + "、".join(f"{c}×{n}" for c, n
                                            in sorted(by_code.items()))))
+            self.q.put(("log", f"  院區：{campus}　日期：{date_span}"))
             t_start = time.time()
+
+            # 開始之前先重讀整張表，當收尾核對的基準。
+            # 不能用 self.all_rows：那是上次按「讀取」時的內容，上一輪改過的列
+            # 在裡面還是舊值 —— 改完沒重讀就再按一次「開始修改」，收尾核對會把
+            # 上一輪改好的列誤報成「根本不該被動到」，還叫人不要存檔、選否還原
+            # （gui_log.txt 實際出現過好幾次）。
+            try:
+                base = self.ris.read_rows()
+                base_count = self.ris.last_raw_count
+            except Exception as e:
+                self.q.put(("log", f"  X 開始前讀不到表格（{type(e).__name__}），什麼都沒改。"))
+                self.q.put(("log", "=" * 60))
+                self.q.put(("popup", (
+                    "沒有開始",
+                    "開始前讀不到 RIS 的表格，什麼都沒改。\n\n"
+                    "請確認 RIS 還開在「醫師班表維護」，再按一次「讀取畫面表格」。",
+                    False)))
+                return
+
             done = 0
             stopped = None
-            written = []      # [(列號, 期待值)]，最後拿來全部核對
+            problem = None     # 收尾核對發現的問題（給使用者看的說明）
+            writes = {}        # {列號: 寫完當下讀到的值}，收尾核對用
             attempted = set()  # 動過手的列。失敗的列也算，免得收尾核對
                                # 把「試過但失敗」誤報成「根本不該被動到」
+            setvalue_rows = []  # 用「直接設值」放進去的列（這條路沒實際存檔驗證過）
             for r, code, display in targets:
                 idx = r["_row"]
+                who = f"第 {idx} 列 {row_tag(r)}".rstrip()    # log 用：列號 + 哪一班
+                # 只在兩列之間停，不會停在打字打到一半
+                if self.stop_req.is_set():
+                    self.q.put(("log", f"  ■ 按了停止：{who}（含）以後都沒動。"))
+                    stopped = f"你按了「停止」，第 {idx} 列（含）以後都沒動。"
+                    break
                 t_row = time.time()
                 # 改之前重新讀一次，確認這一列還是原本那一列
                 now = self.ris.read_row(idx)
                 if now is None:
-                    self.q.put(("log", f"  X 第 {idx} 列讀不到了，中止。"))
+                    self.q.put(("log", f"  X {who} 讀不到了，中止。"))
                     stopped = f"第 {idx} 列讀不到了"
                     break
                 bad = [c for c in ("起始日期", "排班時段", "統計用分類碼",
                                    "排班類別", "排班醫師")
                        if norm(now.get(c)) != norm(r.get(c))]
                 if bad:
-                    self.q.put(("log", f"  X 第 {idx} 列內容變了（{', '.join(bad)}），"
+                    self.q.put(("log", f"  X {who} 內容變了（{', '.join(bad)}），"
                                        f"中止以免改錯。請重新讀取表格。"))
                     stopped = (f"第 {idx} 列的內容跟讀取時不一樣了"
                                f"（{', '.join(bad)}）。\n"
@@ -1620,92 +1877,132 @@ class App(tk.Tk):
                     break
 
                 # 每一列都要走完「點進去 -> 打字 -> Enter」，一步都不能省。
-                t_goto = time.time()
-                moved, how = self.ris.goto_row(idx, col)
-                t_goto = time.time() - t_goto
-                if not moved:
-                    self.q.put(("log", f"  X 第 {idx} 列：{how}，中止（不在不確定的位置寫入）。"))
-                    stopped = (f"游標移不到第 {idx} 列：{how}\n\n"
-                               "為避免寫錯格子已中止。")
-                    break
+                # 每次點擊、送按鍵之前都會檢查目標真的是 RIS 班表（GuardError）。
+                try:
+                    t_goto = time.time()
+                    moved, how = self.ris.goto_row(idx, col)
+                    t_goto = time.time() - t_goto
+                    if not moved:
+                        self.q.put(("log", f"  X {who}：{how}，中止（不在不確定的位置寫入）。"))
+                        stopped = (f"游標移不到第 {idx} 列：{how}\n\n"
+                                   "為避免寫錯格子已中止。")
+                        break
 
-                attempted.add(idx)
-                ok, after, why = self.ris.write_cell(idx, col, code, display)
+                    attempted.add(idx)
+                    ok, after, why = self.ris.write_cell(idx, col, code, display)
+                except GuardError as e:
+                    self.q.put(("log", f"  X {who}：{e}"))
+                    self.q.put(("log", "     為了不把按鍵送到錯的地方，已停止，之後沒有再送任何按鍵。"))
+                    stopped = (f"第 {idx} 列：{e}\n\n"
+                               "為了不把按鍵送到錯的地方，程式已經停止，之後沒有再送任何按鍵。")
+                    break
                 if ok:
                     done += 1
-                    written.append((idx, display or code))
+                    writes[idx] = after
+                    if self.ris.last_path == "直接設值":
+                        setvalue_rows.append(idx)
                     ty, au, cm, n_ent = self.ris.last_timing
-                    self.q.put(("log", f"  V 第 {idx} 列  "
+                    t_total = time.time() - t_row
+                    self.q.put(("log", f"  V {who}  "
                                        f"{norm(r[col])} -> {after}"
-                                       f"  ({time.time() - t_row:.1f}s ="
+                                       f"  ({t_total:.1f}s ="
                                        f" 點{t_goto:.1f} 打{ty:.1f}"
                                        f" 補{au:.1f} 提交{cm:.1f}/{n_ent}次Enter)"))
-                    # 2026-08-10 效能診斷：只加這兩行，不動上面那行的格式。
-                    # 診斷完不需要了整段刪掉即可，其他都不受影響。
+                    if self.ris.last_path not in ("", "鍵盤"):
+                        # 沒有這一行 = 用鍵盤打的（實際存檔驗證過的路徑）
+                        self.q.put(("log", f"      ↑ 這一列是用「{self.ris.last_path}」放進去的"))
+                    # 計時細節（2026-08 效能診斷加的）：正常的列不記，
+                    # 只有異常的列才寫進 gui_log.txt，而且不顯示在訊息區。
                     (t_fnd, t_eon, t_scr, t_foc, t_clk,
                      t_ew, n_clk) = self.ris.last_goto_detail
-                    t_e1, t_e2, t_w1 = self.ris.last_commit_detail
-                    n_ep, t_ep, t_epmax = self.ris.last_editor_poll_detail
-                    n_wp, t_wp, t_wpmax = self.ris.last_wait_value_detail
-                    self.q.put(("log", f"      debug 點=[{how} 找格子{t_fnd:.2f} "
-                                       f"早期editor檢查{t_eon:.2f} 捲{t_scr:.2f} "
-                                       f"焦{t_foc:.2f} 擊{t_clk:.2f} "
-                                       f"等編輯器{t_ew:.2f}/{n_clk}次點擊] "
-                                       f"提交=[Enter1={t_e1:.2f} Enter2={t_e2:.2f} "
-                                       f"等格子{t_w1:.2f}]"))
-                    self.q.put(("log", f"      debug poll細節: "
-                                       f"等編輯器共問{n_ep}次/總{t_ep:.2f}s/單次最久{t_epmax:.2f}s"
-                                       f"　等格子共問{n_wp}次/總{t_wp:.2f}s/單次最久{t_wpmax:.2f}s"))
+                    odd = [label for label, hit in (
+                        (f"超過 {SLOW_ROW_SEC:g} 秒", t_total > SLOW_ROW_SEC),
+                        (f"點了 {n_clk} 次", n_clk > 1),
+                        (f"按了 {n_ent} 次 Enter", n_ent > 2)) if hit]
+                    if odd:
+                        t_e1, t_e2, t_w1 = self.ris.last_commit_detail
+                        n_ep, t_ep, t_epmax = self.ris.last_editor_poll_detail
+                        n_wp, t_wp, t_wpmax = self.ris.last_wait_value_detail
+                        self.q.put(("file", f"      debug 第 {idx} 列（{'、'.join(odd)}）"
+                                            f"點=[{how} 找格子{t_fnd:.2f} "
+                                            f"早期editor檢查{t_eon:.2f} 捲{t_scr:.2f} "
+                                            f"焦{t_foc:.2f} 擊{t_clk:.2f} "
+                                            f"等編輯器{t_ew:.2f}/{n_clk}次點擊] "
+                                            f"提交=[Enter1={t_e1:.2f} Enter2={t_e2:.2f} "
+                                            f"等格子{t_w1:.2f}]"))
+                        self.q.put(("file", f"      debug poll細節: "
+                                            f"等編輯器共問{n_ep}次/總{t_ep:.2f}s/單次最久{t_epmax:.2f}s"
+                                            f"　等格子共問{n_wp}次/總{t_wp:.2f}s/單次最久{t_wpmax:.2f}s"))
                 else:
-                    self.q.put(("log", f"  X 第 {idx} 列（打 {code}）：{why}，中止。"))
+                    self.q.put(("log", f"  X {who}（打 {code}）：{why}，中止。"))
                     stopped = (f"第 {idx} 列打進 {code} 的時候：\n\n{why}\n\n"
                                f"帳號 {code} 可能不正確。\n"
                                "請回 RIS 檢查，需要的話重新查詢並選「否」還原。")
                     break
 
-            # 收尾核對：重讀整張表，逐列比對。
+            # 收尾核對：重讀整張表，跟開始前的基準逐列、逐欄完全比對（見 check_after）。
             # 不能只檢查改過的那幾列 —— 提交用的方向鍵是打在下拉式方塊上的，
             # 萬一改到隔壁那些「不該動」的列，只看目標列永遠看不出來。
-            if done:
+            # 只要動過手（含失敗、中途停止）就核對，不是只有成功的時候。
+            if attempted:
                 self.q.put(("log", "  重讀整張表核對中..."))
-                want = {r["_row"]: norm(r[col]) for r in self.all_rows}
-                want.update({i: norm(v) for i, v in written})
-
                 try:
                     fresh = self.ris.read_rows()
                 except Exception as e:
                     fresh = None
                     self.q.put(("log", f"  !! 重讀失敗（{type(e).__name__}），"
                                        "請自己在畫面上逐列確認再決定要不要存檔。"))
+                    problem = ("改完後重讀表格失敗，沒辦法核對。\n\n"
+                               "請自己在 RIS 畫面逐列確認，再決定要不要存檔。")
 
                 if fresh is not None:
-                    wrong, strays = [], []
-                    for x in fresh:
-                        i, got = x["_row"], norm(x[col])
-                        if i not in want:
-                            continue
-                        if got == want[i] or got.startswith(want[i]):
-                            continue
-                        (wrong if i in attempted else strays).append(
-                            (i, got, want[i]))
+                    res = check_after(base, fresh, col, writes, attempted,
+                                      base_count, self.ris.last_raw_count)
+                    say = lambda s: self.q.put(("log", s))
+                    tags = {x["_row"]: row_tag(x) for x in fresh}
+                    tags.update({x["_row"]: row_tag(x) for x in base})   # 有原本的就用原本的
+                    at = lambda i: f"第 {i} 列 {tags.get(i, '')}".rstrip()
+                    for i, got, exp in res["wrong"]:
+                        say(f"     {at(i)}「{col}」：現在是 {got!r}，預期 {exp!r}")
+                    for i, c, was, now in res["strays"]:
+                        say(f"  !! {at(i)} 根本不該被動到，「{c}」卻從 {was!r} 變成 {now!r}")
+                    for i in res["missing"]:
+                        say(f"  !! {at(i)} 改完之後讀不到了")
+                    for i in res["extra"]:
+                        say(f"  !! 改完之後多出了{at(i)}")
+                    if res["count"]:
+                        say(f"  !! 表格的列數從 {res['count'][0]} 變成 {res['count'][1]}"
+                            "（可能有字打進了最下面的空白新增列）")
+                    for i, c, was, now in res["side"]:
+                        say(f"  ?? {at(i)} 除了「{col}」，「{c}」也從 {was!r} 變成 {now!r}")
 
-                    for i, got, exp in wrong:
-                        self.q.put(("log", f"     第 {i} 列：現在是 {got!r}，預期 {exp!r}"))
-                    for i, got, exp in strays:
-                        self.q.put(("log", f"  !! 第 {i} 列根本不該被動到，"
-                                           f"卻從 {exp!r} 變成 {got!r}"))
-
-                    if strays:
-                        stopped = (f"有 {len(strays)} 列是這次「不該動」的，卻被改掉了。\n\n"
+                    if res["strays"] or res["missing"] or res["extra"] or res["count"]:
+                        problem = ("改完後核對發現，這次「不該動」的地方也變了"
+                                   "（不該動的列被改、列不見了、或多出了列，訊息區有列出）。\n\n"
                                    "請不要存檔。回 RIS 重新查詢，提示選「否」還原，"
                                    "然後把訊息告訴我。")
-                    elif wrong:
-                        stopped = (f"改完後核對發現 {len(wrong)} 列的值不對。\n\n"
+                    elif res["wrong"]:
+                        problem = (f"改完後核對發現 {len(res['wrong'])} 列的值不對。\n\n"
                                    "建議不要存檔，回 RIS 重新查詢並選「否」還原，"
                                    "然後把訊息記下來。")
+                    elif res["side"]:
+                        n_side = len({x[0] for x in res["side"]})
+                        problem = (f"要改的「{col}」都對了，但有 {n_side} 列的其他欄位也跟著變了"
+                                   "（訊息區有列出）。\n\n"
+                                   "如果是 RIS 自動帶出來的（例如改了檢查室，地點跟著變），可以存檔；"
+                                   "不確定的話就不要存檔，回 RIS 重新查詢並選「否」還原。")
                     else:
                         self.q.put(("log", f"  核對通過：{done} 列已改，"
-                                           "其他列都沒被動到。"))
+                                           "其他列、其他欄位都沒被動到。"))
+
+            # 用「直接設值」放進去的列：畫面上是對的，但這條路還沒實際存檔驗證過
+            setvalue_note = ""
+            if setvalue_rows:
+                setvalue_note = ("※ 第 " + "、".join(str(i) for i in setvalue_rows)
+                                 + " 列是用「直接設值」放進去的（打字送不進去時的備用方法），"
+                                 "這條路還沒實際存檔驗證過。存檔後請在 RIS 重新查詢，"
+                                 "確認這幾列真的改了。")
+                self.q.put(("log", "  " + setvalue_note))
 
             self.q.put(("log", f"完成 {done} / {len(targets)} 列"
                                f"（共 {time.time() - t_start:.1f} 秒）"))
@@ -1715,11 +2012,16 @@ class App(tk.Tk):
             self.q.put(("log", "=" * 60))
 
             # 跳視窗提醒，免得改完沒注意到、忘了存檔
-            if stopped:
+            if stopped or problem:
+                body = f"已改了 {done} 列"
+                body += f"，然後停在這裡：\n\n{stopped}\n\n" if stopped else "。\n\n"
+                if problem:
+                    body += problem + "\n\n"
+                if setvalue_note:
+                    body += setvalue_note + "\n\n"
                 self.q.put(("popup", (
-                    "中途停止",
-                    f"已改了 {done} 列，然後停在這裡：\n\n{stopped}\n\n"
-                    "程式沒有存檔。",
+                    "中途停止" if stopped else "改完了，但核對有問題",
+                    body + "程式沒有存檔。",
                     False)))
             elif done:
                 self.q.put(("popup", (
@@ -1731,11 +2033,17 @@ class App(tk.Tk):
                     "  1. 切回 RIS 看一下改的內容對不對\n"
                     "  2. 沒問題就按「存檔」\n"
                     "  3. 想放棄的話，重新查詢一次，跳出提示時選「否」\n\n"
-                    "※ 程式沒有存檔，現在資料庫裡還是原本的內容。\n"
+                    + (setvalue_note + "\n\n" if setvalue_note else "")
+                    + "※ 程式沒有存檔，現在資料庫裡還是原本的內容。\n"
                     "※ 在你決定之前，不要關視窗或重新查詢。",
                     True)))
 
+        if self.busy:
+            return
+        self.stop_req.clear()
+        self.applying = True
         self._run(job)
+        self.btn_stop.config(state="normal")
 
 
 if __name__ == "__main__":
